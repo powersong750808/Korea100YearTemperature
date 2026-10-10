@@ -67,8 +67,8 @@ def main():
     previous=json.loads(OUT.read_text(encoding='utf-8')) if OUT.exists() else {}
     records={str(y):v for y,v in previous.get('records',{}).items() if int(y)<current}
     # First run: 3 recent years. Each later run adds 3 older years; monthly schedule backfills gradually.
-    missing=[y for y in range(current-1,1903,-1) if str(y) not in records]
-    years=missing[:3]
+    missing=[y for y in range(current-1,1924,-1) if str(y) not in records]
+    years=missing[:10]
     if not years:
         years=[current-1]  # refresh latest year
     success=0
