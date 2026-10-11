@@ -22,8 +22,8 @@
 </head>
 <body>
 <main class="wrap"><div class="panel">
-  <h1>대한민국 100년 관측소 연평균기온</h1>
-  <p>기상청 공식 관측자료 · 연도별 평균기온(℃) · 지난해까지의 확정 관측자료</p>
+  <h1>대한민국 100년 관측소 기온변화</h1>
+  <p>기상청 ASOS 관측자료 · 연평균기온 및 연최고기온(℃) · 지난해까지의 자료</p>
   <div class="tabs" id="tabs" role="tablist" aria-label="관측소 선택"></div>
   <div id="status">관측자료를 불러오는 중입니다.</div>
   <div id="trendSummary" aria-live="polite"></div>
@@ -31,12 +31,15 @@
   <footer id="source">자료 출처: 기상청 API허브 · 지상기상연보 연요약자료</footer>
 </div></main>
 <script>
-let records = {}, chart, selected = '서울';
+let records = {}, maxRecords = {}, chart, selected = '서울';
 const names = ['서울','부산','제주','인천','목포','대구','강릉','전주'];
 const cutoff = new Date().getFullYear() - 1;
 const status = document.getElementById('status');
 const tabs = document.getElementById('tabs');
 const trendSummary = document.getElementById('trendSummary');
+const maxInfo = document.createElement('div');
+maxInfo.style.cssText = 'margin:0 0 12px;color:#9a4e16;font-weight:700';
+trendSummary.after(maxInfo);
 
 function selectStation(name) {
   selected = name;
@@ -76,52 +79,61 @@ function linearTrend(years, values) {
 
 function draw() {
   const name = selected;
-  const rows = Object.entries(records)
-    .filter(([year, data]) => Number(year) <= cutoff && data && Number.isFinite(data[name]))
-    .sort((a,b) => +a[0] - +b[0]);
-  if (!rows.length) {
-    status.textContent = name + ' 관측소에 표시할 실제 연평균기온 자료가 없습니다.';
+  const avgRows = Object.entries(records)
+    .filter(([year, data]) => +year <= cutoff && data && Number.isFinite(data[name]));
+  const highRows = Object.entries(maxRecords)
+    .filter(([year, data]) => +year <= cutoff && data && Number.isFinite(data[name]));
+  const years = [...new Set([...avgRows, ...highRows].map(([year]) => +year))]
+    .sort((a,b) => a-b);
+  if (!years.length) {
+    status.textContent = name + ' 관측소에 표시할 자료가 없습니다.';
     trendSummary.textContent = '';
+    maxInfo.textContent = '';
     if (chart) { chart.destroy(); chart = null; }
     return;
   }
-  const labels = rows.map(([year]) => year);
-  const years = labels.map(Number);
-  const values = rows.map(([, data]) => data[name]);
-  const trend = linearTrend(years, values);
-  status.textContent = `${name}: ${labels[0]}~${labels.at(-1)}년 · ${rows.length}개 연도 관측자료`;
-  trendSummary.textContent = trend
-    ? `장기 선형 추세: 10년당 ${trend.slope >= 0 ? '+' : ''}${(trend.slope * 10).toFixed(3)}℃ (${labels[0]}~${labels.at(-1)}년 기준)`
-    : '추세선을 계산하기 위한 관측 연도가 부족합니다.';
-
-  const datasets = [{
-    label: name + ' 연평균기온 (℃)', data: values,
-    borderColor: '#1677bd', backgroundColor: '#1677bd',
-    pointRadius: 1.6, borderWidth: 2, tension: .12
-  }];
-  if (trend) datasets.push({
-    label: '장기 선형 추세선', data: trend.values,
-    borderColor: '#d94841', backgroundColor: '#d94841',
-    borderDash: [8,5], pointRadius: 0, pointHoverRadius: 0,
-    borderWidth: 3, tension: 0
-  });
-
+  const avgMap = Object.fromEntries(avgRows.map(([y, d]) => [+y, d[name]]));
+  const highMap = Object.fromEntries(highRows.map(([y, d]) => [+y, d[name]]));
+  const averageYears = years.filter(y => Number.isFinite(avgMap[y]));
+  const highYears = years.filter(y => Number.isFinite(highMap[y]));
+  const avgTrend = linearTrend(averageYears, averageYears.map(y => avgMap[y]));
+  const highTrend = linearTrend(highYears, highYears.map(y => highMap[y]));
+  const fmt = (t) => `${t.slope >= 0 ? '+' : ''}${(t.slope * 10).toFixed(3)}℃/10년`;
+  status.textContent = `${name}: ${years[0]}~${years.at(-1)}년 · 연평균 ${averageYears.length}개 연도 · 연최고 ${highYears.length}개 연도`;
+  trendSummary.textContent = avgTrend
+    ? `연평균기온 장기 추세: ${fmt(avgTrend)} (${averageYears[0]}~${averageYears.at(-1)}년)`
+    : '연평균기온 추세를 계산할 자료가 부족합니다.';
+  maxInfo.textContent = highTrend
+    ? `연최고기온 장기 추세: ${fmt(highTrend)} (${highYears[0]}~${highYears.at(-1)}년)`
+    : '연최고기온 자료를 수집 중입니다. GitHub Actions 실행 후 표시됩니다.';
+  const dataFor = map => years.map(y => Number.isFinite(map[y]) ? map[y] : null);
+  const trendFor = (t, ys) => years.map(y =>
+    t && y >= ys[0] && y <= ys.at(-1)
+      ? t.values[0] + t.slope * (y - ys[0]) : null);
+  const datasets = [
+    { label:'연평균기온 (℃)', data:dataFor(avgMap), borderColor:'#1677bd',
+      backgroundColor:'#1677bd', pointRadius:1.6, borderWidth:2, tension:0, spanGaps:false },
+    { label:'연평균기온 추세선', data:trendFor(avgTrend, averageYears),
+      borderColor:'#d94841', borderDash:[8,5], pointRadius:0, borderWidth:3, spanGaps:true },
+    { label:'연최고기온 (℃)', data:dataFor(highMap), borderColor:'#e58a20',
+      backgroundColor:'#e58a20', pointRadius:1.6, borderWidth:2, tension:0, spanGaps:false },
+    { label:'연최고기온 추세선', data:trendFor(highTrend, highYears),
+      borderColor:'#8a50b4', borderDash:[8,5], pointRadius:0, borderWidth:3, spanGaps:true }
+  ];
   if (chart) chart.destroy();
   chart = new Chart(document.getElementById('chart'), {
-    type: 'line',
-    data: { labels, datasets },
-    options: {
-      responsive: true, maintainAspectRatio: false,
-      interaction: { mode: 'index', intersect: false },
-      plugins: {
-        legend: { display: true },
-        tooltip: { callbacks: {
-          label: ctx => `${ctx.dataset.label}: ${ctx.parsed.y.toFixed(2)} ℃`
-        }}
+    type:'line', data:{labels:years.map(String), datasets},
+    options:{
+      responsive:true, maintainAspectRatio:false,
+      interaction:{mode:'index', intersect:false},
+      plugins:{
+        legend:{display:true},
+        tooltip:{callbacks:{label:ctx =>
+          ctx.parsed.y === null ? '' : `${ctx.dataset.label}: ${ctx.parsed.y.toFixed(2)} ℃`}}
       },
-      scales: {
-        x: { title: { display: true, text: '연도' }, ticks: { maxTicksLimit: 14 } },
-        y: { title: { display: true, text: '연평균기온 (℃)' } }
+      scales:{
+        x:{title:{display:true,text:'연도'},ticks:{maxTicksLimit:14}},
+        y:{title:{display:true,text:'기온 (℃)'}}
       }
     }
   });
@@ -131,6 +143,7 @@ fetch('temperature.json?ts=' + Date.now())
   .then(r => { if (!r.ok) throw Error('자료 파일 없음'); return r.json(); })
   .then(data => {
     records = data.records || {};
+    maxRecords = data.max_records || {};
     document.getElementById('source').textContent = '자료 출처: ' + data.source + ' · 갱신: ' + data.updated_at;
     draw();
   })

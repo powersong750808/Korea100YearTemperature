@@ -1,147 +1,95 @@
-"""Backfill actual KMA ASOS daily mean temperatures into annual means.
-
-One run processes a bounded batch, preserving completed years and retrying
-transient errors. GitHub Actions schedules subsequent batches automatically.
-"""
-import json
-import os
-import random
-import re
-import time
-import urllib.error
-import urllib.parse
-import urllib.request
+"""기존 연평균 자료를 보존하며 연최고기온을 점진적으로 수집합니다."""
+import json, os, urllib.parse, urllib.request, urllib.error
 from collections import defaultdict
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-API = 'https://apihub.kma.go.kr/api/typ01/url/kma_sfcdd3.php'
-STATIONS = {'서울': 108, '부산': 159, '제주': 184, '인천': 112,
-            '목포': 165, '대구': 143, '강릉': 105, '전주': 146}
-OUT = Path(__file__).with_name('temperature.json')
+API = "https://apihub.kma.go.kr/api/typ01/url/kma_sfcdd3.php"
+STATIONS = {"서울":108,"부산":159,"제주":184,"인천":112,"목포":165,"대구":143,"강릉":105,"전주":146}
+OUT = Path(__file__).with_name("temperature.json")
 KST = timezone(timedelta(hours=9))
-START_YEAR = 1925
-END_YEAR = 2025  # fixed requested historical window
-YEARS_PER_RUN = 10
-MAX_RETRIES = 3
-MIN_DAYS = 300
-
-COLUMNS = ('TM STN WS_AVG WR_DAY WD_MAX WS_MAX WS_MAX_TM WD_INS WS_INS WS_INS_TM '
-           'TA_AVG TA_MAX TA_MAX_TM TA_MIN TA_MIN_TM TD_AVG TS_AVG TG_MIN HM_AVG '
-           'HM_MIN HM_MIN_TM PV_AVG EV_S EV_L FG_DUR PA_AVG PS_AVG PS_MAX '
-           'PS_MAX_TM PS_MIN PS_MIN_TM CA_TOT SS_DAY SS_DUR SS_CMB SI_DAY '
-           'SI_60M_MAX SI_60M_MAX_TM RN_DAY RN_D99 RN_DUR RN_60M_MAX '
-           'RN_60M_MAX_TM RN_10M_MAX RN_10M_MAX_TM RN_POW_MAX RN_POW_MAX_TM '
-           'SD_NEW SD_NEW_TM SD_MAX SD_MAX_TM TE_05 TE_10 TE_15 TE_30 TE_50').split()
-
-
-def get_text(year, key):
-    params = {'tm1': f'{year}0101', 'tm2': f'{year}1231', 'obs': 'TA',
-              'stn': ':'.join(map(str, STATIONS.values())),
-              'help': 0, 'authKey': key}
-    url = API + '?' + urllib.parse.urlencode(params)
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            request = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(request, timeout=90) as response:
-                text = response.read().decode('utf-8-sig', 'replace')
-            if text.lstrip().startswith('<') or any(x in text.lower() for x in
-                    ('forbidden', 'unauthorized', 'invalid auth', 'error:')):
-                raise ValueError('Unexpected API response: ' + text[:160])
-            return text
-        except urllib.error.HTTPError as exc:
-            if exc.code in (401, 403):
-                raise RuntimeError(f'API authorization error HTTP {exc.code}') from exc
-            if exc.code not in (429, 500, 502, 503, 504):
-                raise RuntimeError(f'API HTTP {exc.code}') from exc
-            print(f'{year}: HTTP {exc.code}, attempt {attempt}/{MAX_RETRIES}', flush=True)
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
-            print(f'{year}: network error {exc}, attempt {attempt}/{MAX_RETRIES}', flush=True)
-        if attempt < MAX_RETRIES:
-            time.sleep(5 * attempt)
-    raise RuntimeError(f'{year}: failed after {MAX_RETRIES} attempts')
-
+COLUMNS = """TM STN WS_AVG WR_DAY WD_MAX WS_MAX WS_MAX_TM WD_INS WS_INS WS_INS_TM
+TA_AVG TA_MAX TA_MAX_TM TA_MIN TA_MIN_TM TD_AVG TS_AVG TG_MIN HM_AVG HM_MIN HM_MIN_TM
+PV_AVG EV_S EV_L FG_DUR PA_AVG PS_AVG PS_MAX PS_MAX_TM PS_MIN PS_MIN_TM CA_TOT
+SS_DAY SS_DUR SS_CMB SI_DAY SI_60M_MAX SI_60M_MAX_TM RN_DAY RN_D99 RN_DUR
+RN_60M_MAX RN_60M_MAX_TM RN_10M_MAX RN_10M_MAX_TM RN_POW_MAX RN_POW_MAX_TM
+SD_NEW SD_NEW_TM SD_MAX SD_MAX_TM TE_05 TE_10 TE_15 TE_30 TE_50""".split()
 
 def fetch_year(year, key):
-    text = get_text(year, key)
-    sums, counts = defaultdict(float), defaultdict(int)
-    headers = COLUMNS
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
+    params = {"tm1":f"{year}0101","tm2":f"{year}1231","obs":"TA",
+              "stn":":".join(map(str,STATIONS.values())),"help":0,"authKey":key}
+    url = API + "?" + urllib.parse.urlencode(params)
+    with urllib.request.urlopen(urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0"}),timeout=90) as r:
+        content = r.read().decode("utf-8-sig","replace")
+    if content.lstrip().startswith("<") or "unauthorized" in content.lower():
+        raise RuntimeError("기상청 응답 오류: "+content[:160])
+    sums=defaultdict(float); avg_count=defaultdict(int)
+    maxima={}; max_count=defaultdict(int)
+    headers=COLUMNS
+    for line in content.splitlines():
+        s=line.strip()
+        if not s: continue
+        if s.startswith("#"):
+            candidate=s.lstrip("#").strip().split()
+            if all(c in candidate for c in ("TM","STN","TA_AVG","TA_MAX")):
+                headers=candidate
             continue
-        if line.startswith('#'):
-            candidate = line.lstrip('#').strip().split()
-            if {'TM', 'STN', 'TA_AVG'}.issubset(candidate):
-                headers = candidate
-            continue
-        parts = line.split()
-        if len(parts) < len(headers):
-            continue
-        row = dict(zip(headers, parts))
+        parts=s.split()
+        if len(parts)<len(headers): continue
+        row=dict(zip(headers,parts))
         try:
-            stn = int(row['STN'])
-            day = row['TM'][:8]
-            temp = float(row['TA_AVG'])
-            if stn not in STATIONS.values() or len(day) != 8 or int(day[:4]) != year:
-                continue
-            date.fromisoformat(f'{day[:4]}-{day[4:6]}-{day[6:8]}')
-            if not -60 < temp < 60:
-                continue
-        except (ValueError, KeyError):
-            continue
-        sums[stn] += temp
-        counts[stn] += 1
-    if not counts:
-        raise RuntimeError(f'{year}: no valid daily temperatures; response: {text[:100]!r}')
-    values = {name: round(sums[stn] / counts[stn], 2) if counts[stn] >= MIN_DAYS else None
-              for name, stn in STATIONS.items()}
-    print(f'{year}: ' + ', '.join(f'{name}={counts[stn]} days' for name, stn in STATIONS.items()), flush=True)
-    return values
-
-
-def save(records):
-    payload = {'source': '기상청 API허브 종관기상관측(ASOS) 일자료 TA_AVG 연도별 산술평균 (300일 이상)',
-               'updated_at': datetime.now(KST).isoformat(timespec='seconds'),
-               'stations': STATIONS, 'records': dict(sorted(records.items()))}
-    tmp = OUT.with_suffix('.json.tmp')
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
-    tmp.replace(OUT)
-
+            stn=int(row["STN"])
+            if stn not in STATIONS.values() or int(row["TM"][:4])!=year: continue
+        except (KeyError,ValueError): continue
+        try:
+            avg=float(row["TA_AVG"])
+            if -60<avg<60:
+                sums[stn]+=avg; avg_count[stn]+=1
+        except (ValueError,KeyError): pass
+        try:
+            high=float(row["TA_MAX"])
+            if -60<high<60:
+                maxima[stn]=max(maxima.get(stn,-100),high)
+                max_count[stn]+=1
+        except (ValueError,KeyError): pass
+    avg_result={}; high_result={}
+    for name,stn in STATIONS.items():
+        avg_result[name]=round(sums[stn]/avg_count[stn],2) if avg_count[stn]>=300 else None
+        high_result[name]=round(maxima[stn],2) if max_count[stn]>=300 else None
+    print(f"{year}: 연평균 유효일수 {sum(avg_count.values())}, 최고기온 유효일수 {sum(max_count.values())}")
+    return avg_result,high_result
 
 def main():
-    key = os.environ.get('KMA_API_KEY', '').strip()
-    if not key:
-        raise RuntimeError('GitHub Secret KMA_API_KEY is missing')
-    existing = json.loads(OUT.read_text(encoding='utf-8')) if OUT.exists() else {}
-    records = {str(y): v for y, v in existing.get('records', {}).items()
-               if str(y).isdigit() and START_YEAR <= int(y) <= END_YEAR}
-    missing = [year for year in range(END_YEAR, START_YEAR - 1, -1)
-               if str(year) not in records]
-    if not missing:
-        print(f'Complete: {len(records)} years stored (not all stations necessarily available).')
-        return
-    # Process the next missing years; one run is short enough for hosted runners.
-    batch = missing[:YEARS_PER_RUN]
-    print(f'Backfill batch: {batch}; existing years: {len(records)}', flush=True)
-    failed = []
-    for year in batch:
+    key=os.environ.get("KMA_API_KEY","").strip()
+    if not key: raise RuntimeError("GitHub Secret KMA_API_KEY가 필요합니다.")
+    if not OUT.exists(): raise RuntimeError("기존 temperature.json이 없습니다. 기존 파일을 유지해 주세요.")
+    payload=json.loads(OUT.read_text(encoding="utf-8"))
+    records=payload.get("records",{})
+    max_records=payload.get("max_records",{})
+    current=datetime.now(KST).year
+    # 이미 저장된 연평균기온을 우선 보존합니다.
+    # 최고기온이 없는 기존 연도부터 매 실행 최대 8개 연도씩 추가합니다.
+    pending=sorted((int(y) for y in records if int(y)<current and y not in max_records),reverse=True)
+    if not pending:
+        print("기존 연도 최고기온 수집 완료. 최신 연도를 재검증합니다.")
+        pending=[current-1]
+    failures=[]
+    for year in pending[:8]:
         try:
-            result = fetch_year(year, key)
-            if not any(value is not None for value in result.values()):
-                raise RuntimeError('Fewer than 300 valid days at every station')
-            records[str(year)] = result
-            save(records)
-            print(f'SAVED {year}; total years={len(records)}', flush=True)
+            avg,high=fetch_year(year,key)
+            # 기존 연평균기온은 절대 덮어쓰지 않습니다.
+            max_records[str(year)]=high
         except Exception as exc:
-            failed.append(year)
-            print(f'SKIPPED {year}: {exc}', flush=True)
-        time.sleep(2)
-    print(f'FINISHED: stored={len(records)} years, failed this batch={failed}', flush=True)
-    if failed:
-        print('Missing years will be retried in subsequent runs.', flush=True)
+            failures.append(f"{year}: {exc}")
+            print("수집 실패:",failures[-1])
+    if not max_records:
+        raise RuntimeError("연최고기온 수집 실패: "+"; ".join(failures))
+    payload["max_records"]=dict(sorted(max_records.items(),key=lambda kv:int(kv[0])))
+    payload["max_source"]="기상청 ASOS 일자료 TA_MAX의 연도별 최댓값 (유효일수 300일 이상)"
+    payload["updated_at"]=datetime.now(KST).isoformat(timespec="seconds")
+    OUT.write_text(json.dumps(payload,ensure_ascii=False,indent=2),encoding="utf-8")
+    print(f"연평균 {len(records)}개 연도 보존, 연최고 {len(max_records)}개 연도 저장")
+    if failures: print("일부 연도 실패:", "; ".join(failures))
 
-
-if __name__ == '__main__':
+if __name__=="__main__":
     main()
-
